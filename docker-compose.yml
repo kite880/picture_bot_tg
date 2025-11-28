@@ -1,0 +1,23 @@
+services:
+  picture-bot:
+    image: picture-bot:latest
+    container_name: picture-bot
+    restart: always
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      CHAT_ID: ${CHAT_ID}
+      IMAGE_SOURCE: ${IMAGE_SOURCE}
+      GOOGLE_DRIVE_CREDENTIALS: ${GOOGLE_DRIVE_CREDENTIALS}
+      GOOGLE_DRIVE_FOLDER_ID: ${GOOGLE_DRIVE_FOLDER_ID}
+      SEND_INTERVAL: ${SEND_INTERVAL}
+      START_HOUR: ${START_HOUR}
+      END_HOUR: ${END_HOUR}
+    volumes:
+      - ./zolotuhin-8706a2b9bf6a.json:/app/zolotuhin-8706a2b9bf6a.json:ro
+      - ./image_cache:/app/image_cache
+      - ./sent_history.json:/app/sent_history.json
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

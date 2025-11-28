@@ -1,0 +1,394 @@
+import os
+import logging
+import random
+import schedule
+import time
+import threading
+from pathlib import Path
+from config import Config
+from history import HistoryManager
+from google_drive import GoogleDriveManager
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import TelegramError
+
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Initialize bot
+bot = Bot(token=Config.BOT_TOKEN)
+
+# Initialize history manager
+history_manager = HistoryManager()
+
+# Google Drive manager (if using Google Drive)
+google_drive_manager = None
+
+# Available images
+available_images = []
+
+
+def load_images():
+    """Load all images from configured source."""
+    global available_images, google_drive_manager
+
+    if Config.IMAGE_SOURCE == "google_drive":
+        return load_images_from_google_drive()
+    else:
+        return load_images_from_local()
+
+
+def load_images_from_local():
+    """Load images from local folder."""
+    global available_images
+
+    if not Config.IMAGES_PATH or not os.path.exists(Config.IMAGES_PATH):
+        logger.error(f"Images path not found: {Config.IMAGES_PATH}")
+        return False
+
+    images_path = Path(Config.IMAGES_PATH)
+
+    available_images = [
+        str(f) for f in images_path.iterdir()
+        if f.is_file() and f.suffix.lower() in Config.IMAGE_EXTENSIONS
+    ]
+
+    if not available_images:
+        logger.error(f"No images found in {Config.IMAGES_PATH}")
+        return False
+
+    logger.info(f"Loaded {len(available_images)} images from {Config.IMAGES_PATH}")
+    return True
+
+
+def load_images_from_google_drive():
+    """Load images from Google Drive."""
+    global available_images, google_drive_manager
+
+    try:
+        google_drive_manager = GoogleDriveManager(
+            Config.GOOGLE_DRIVE_CREDENTIALS,
+            Config.GOOGLE_DRIVE_FOLDER_ID
+        )
+
+        if not google_drive_manager.load_images():
+            logger.error("Failed to load images from Google Drive")
+            return False
+
+        available_images = google_drive_manager.get_image_list()
+        logger.info(f"Loaded {len(available_images)} images from Google Drive")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error loading images from Google Drive: {e}")
+        return False
+
+
+def get_random_image():
+    """Get a random image that hasn't been sent before."""
+    # Filter out images that have been sent
+    unsent_images = history_manager.get_unsent_images(available_images)
+
+    if not unsent_images:
+        # If all images have been sent
+        logger.warning("All images have been sent! No more unsent images available.")
+        stats = history_manager.get_stats()
+        logger.warning(f"Total images sent so far: {stats['total_sent']}")
+        return None
+
+    selected_image = random.choice(unsent_images)
+    return selected_image
+
+
+async def send_image(chat_id):
+    """Send a random image to the specified chat."""
+    try:
+        image_name = get_random_image()
+
+        if not image_name:
+            logger.error("No unsent images available")
+            return False
+
+        # For Google Drive, download the image first
+        if Config.IMAGE_SOURCE == "google_drive":
+            image_path = await download_image_from_google_drive(image_name)
+            if not image_path:
+                logger.error(f"Failed to download image: {image_name}")
+                return False
+        else:
+            image_path = image_name
+
+        with open(image_path, 'rb') as image_file:
+            await bot.send_photo(chat_id=chat_id, photo=image_file)
+            # Add to history after successful send
+            history_manager.add_image(image_name)
+            logger.info(f"Image sent: {image_name}")
+
+            # Clean up cache for Google Drive images
+            if Config.IMAGE_SOURCE == "google_drive":
+                try:
+                    os.remove(image_path)
+                    logger.debug(f"Cache cleaned: {image_name}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean cache: {e}")
+
+            return True
+
+    except TelegramError as e:
+        logger.error(f"Telegram error: {e}")
+        return False
+    except FileNotFoundError as e:
+        logger.error(f"File not found: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        return False
+
+
+async def download_image_from_google_drive(image_name: str) -> str:
+    """Download image from Google Drive. Returns local path."""
+    try:
+        # Create cache directory if it doesn't exist
+        cache_dir = Config.GOOGLE_DRIVE_CACHE_DIR
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # Get image info from Google Drive manager
+        image_info = google_drive_manager.get_image_by_name(image_name)
+        if not image_info:
+            logger.error(f"Image not found in Google Drive: {image_name}")
+            return None
+
+        # Download the image
+        local_path = os.path.join(cache_dir, image_name)
+        success = google_drive_manager.download_image(
+            image_info['id'],
+            image_name,
+            cache_dir
+        )
+
+        if success:
+            return local_path
+        else:
+            return None
+
+    except Exception as e:
+        logger.error(f"Error downloading image from Google Drive: {e}")
+        return None
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command."""
+    await update.message.reply_text(
+        "👋 Привет! Я бот для отправки картинок.\n\n"
+        "Доступные команды:\n"
+        "/stats - показать статистику\n"
+        "/send_now - отправить одну картинку сейчас\n"
+        "/reset_history - сбросить историю отправок (все картинки станут новыми)\n"
+        "/help - справка"
+    )
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /stats command."""
+    stats = history_manager.get_stats()
+    unsent = history_manager.get_unsent_images(available_images)
+
+    message = (
+        "📊 Статистика:\n\n"
+        f"Всего картинок в папке: {len(available_images)}\n"
+        f"Отправлено картинок: {stats['total_sent']}\n"
+        f"Осталось неотправленных: {len(unsent)}\n"
+    )
+
+    if len(available_images) > 0:
+        percentage = (stats['total_sent'] / len(available_images)) * 100
+        message += f"Прогресс: {percentage:.1f}%"
+
+    await update.message.reply_text(message)
+
+
+async def cmd_reset_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /reset_history command."""
+    cleared_count = history_manager.reset_history()
+    await update.message.reply_text(
+        f"🔄 История сброшена!\n"
+        f"Удалено {cleared_count} записей о отправленных картинках.\n"
+        f"Теперь все картинки считаются новыми."
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command."""
+    help_text = (
+        "ℹ️ Справка по командам:\n\n"
+        "/start - главное меню\n"
+        "/stats - показать статистику отправок\n"
+        "/send_now - отправить одну картинку сейчас\n"
+        "/reset_history - сбросить всю историю отправок\n"
+        "/help - эта справка\n\n"
+        "Бот автоматически отправляет картинки по расписанию.\n"
+        "Картинки не повторяются, пока вы не сбросите историю."
+    )
+    await update.message.reply_text(help_text)
+
+
+async def cmd_send_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /send_now command - send one image immediately."""
+    # Get unsent images
+    unsent = history_manager.get_unsent_images(available_images)
+
+    if not unsent:
+        await update.message.reply_text(
+            "⚠️ Нет новых картинок для отправки!\n"
+            "Все картинки уже были отправлены.\n\n"
+            "Используйте /reset_history для сброса истории."
+        )
+        return
+
+    # Send image to configured channel (not to personal chat)
+    try:
+        channel_id = int(Config.CHAT_ID)
+    except ValueError:
+        channel_id = Config.CHAT_ID
+
+    success = await send_image(channel_id)
+
+    if success:
+        await update.message.reply_text("✅ Картинка отправлена в канал!")
+    else:
+        await update.message.reply_text("❌ Ошибка при отправке картинки")
+
+
+# Note: Commands can be async, Application handles them properly
+
+
+def setup_command_handlers(app: Application):
+    """Setup bot command handlers."""
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("send_now", cmd_send_now))
+    app.add_handler(CommandHandler("reset_history", cmd_reset_history))
+    app.add_handler(CommandHandler("help", cmd_help))
+    logger.info("Command handlers registered")
+
+
+async def setup_bot_commands(app: Application):
+    """Register commands in Telegram."""
+    from telegram import BotCommand
+
+    commands = [
+        BotCommand("start", "Главное меню"),
+        BotCommand("stats", "Статистика отправок"),
+        BotCommand("send_now", "Отправить одну картинку сейчас"),
+        BotCommand("reset_history", "Сбросить историю отправок"),
+        BotCommand("help", "Справка по командам"),
+    ]
+
+    try:
+        await app.bot.set_my_commands(commands)
+        logger.info("Bot commands registered in Telegram")
+    except Exception as e:
+        logger.error(f"Failed to register commands: {e}")
+
+
+def schedule_sends(chat_id):
+    """Schedule image sends during working hours."""
+    schedule.clear()
+
+    # Create sync wrapper for async send_image
+    send_task = create_schedule_task(chat_id)
+
+    current_hour = Config.START_HOUR
+    while current_hour < Config.END_HOUR:
+        schedule_time = f"{current_hour:02d}:00"
+        schedule.every().day.at(schedule_time).do(send_task)
+        logger.info(f"Scheduled send at {schedule_time}")
+        current_hour += Config.SEND_INTERVAL
+
+    logger.info(f"Scheduling enabled: {Config.START_HOUR}:00 to {Config.END_HOUR}:00 every {Config.SEND_INTERVAL} hours")
+
+
+def create_schedule_task(chat_id):
+    """Create a sync wrapper for async send_image."""
+    def send_image_sync():
+        """Sync wrapper to run async send_image."""
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Event loop already running, create new one
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                new_loop.run_until_complete(send_image(chat_id))
+                new_loop.close()
+            else:
+                loop.run_until_complete(send_image(chat_id))
+        except Exception as e:
+            logger.error(f"Error in scheduled send: {e}")
+    return send_image_sync
+
+
+def scheduler_loop():
+    """Main scheduler loop - runs in background."""
+    while True:
+        schedule.run_pending()
+        time.sleep(60)  # Check every minute
+
+
+def main():
+    """Main function."""
+    logger.info("Starting Picture Bot...")
+
+    # Validate configuration
+    is_valid, errors = Config.is_valid()
+    if not is_valid:
+        logger.error("Configuration errors:")
+        for error in errors:
+            logger.error(f"  - {error}")
+        return
+
+    # Load images
+    if not load_images():
+        logger.error("Failed to load images")
+        return
+
+    # Parse chat_id (can be number or @channel_name)
+    try:
+        chat_id = int(Config.CHAT_ID)
+    except ValueError:
+        # It's a channel name like @drunklinked
+        chat_id = Config.CHAT_ID
+
+    # Initialize and setup Application
+    application = Application.builder().token(Config.BOT_TOKEN).build()
+
+    # Set post_init callback to register commands
+    application.post_init = lambda app: setup_bot_commands(app)
+
+    setup_command_handlers(application)
+
+    logger.info("Bot connected successfully")
+
+    # Schedule image sends
+    schedule_sends(chat_id)
+    logger.info("Image sending scheduler configured")
+
+    # Start background scheduler thread
+    scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
+    scheduler_thread.start()
+    logger.info("Scheduler thread started")
+
+    # Run the bot
+    try:
+        logger.info("Bot is running... Press Ctrl+C to stop.")
+        application.run_polling()
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+
+
+if __name__ == "__main__":
+    main()
