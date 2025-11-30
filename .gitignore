@@ -3,9 +3,6 @@
 .env.local
 .env.*.local
 
-# History file
-sent_history.json
-
 # Python
 __pycache__/
 *.py[cod]
@@ -50,9 +47,8 @@ venv.bak/
 *.log
 logs/
 
-# Google Drive Credentials
-zolotuhin-8706a2b9bf6a.json
-*.json
+# Google Drive Credentials (credentials only, not history)
+zolotuhin-*.json
 
 # Image cache
 image_cache/
