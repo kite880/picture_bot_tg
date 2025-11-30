@@ -6,8 +6,8 @@ from pathlib import Path
 from config import Config
 from history import HistoryManager
 from google_drive import GoogleDriveManager
-from telegram import Bot, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Bot, Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.error import TelegramError
 
 # Setup logging
@@ -28,6 +28,9 @@ google_drive_manager = None
 
 # Available images
 available_images = []
+
+# Current send interval in minutes (can be changed at runtime)
+current_send_interval = 60  # Default 1 hour in minutes
 
 
 def load_images():
@@ -179,14 +182,18 @@ async def download_image_from_google_drive(image_name: str) -> str:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command."""
+    """Handle /start command with keyboard buttons."""
+    keyboard = [
+        [KeyboardButton("📊 Статистика"), KeyboardButton("🖼️ Отправить сейчас")],
+        [KeyboardButton("⚙️ Интервал"), KeyboardButton("🔄 Сбросить историю")],
+        [KeyboardButton("ℹ️ Справка")],
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
     await update.message.reply_text(
         "👋 Привет! Я бот для отправки картинок.\n\n"
-        "Доступные команды:\n"
-        "/stats - показать статистику\n"
-        "/send_now - отправить одну картинку сейчас\n"
-        "/reset_history - сбросить историю отправок (все картинки станут новыми)\n"
-        "/help - справка"
+        "Выбери действие из кнопок ниже:",
+        reply_markup=reply_markup
     )
 
 
@@ -261,9 +268,79 @@ async def cmd_send_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Ошибка при отправке картинки")
 
 
+async def cmd_set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /set_interval command - show interval options."""
+    keyboard = [
+        [KeyboardButton("15 мин"), KeyboardButton("30 мин")],
+        [KeyboardButton("45 мин"), KeyboardButton("1 час")],
+        [KeyboardButton("Назад")],
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+    await update.message.reply_text(
+        f"⚙️ Текущий интервал: {current_send_interval} минут\n\n"
+        "Выбери новый интервал для отправки картинок:",
+        reply_markup=reply_markup
+    )
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button presses and text messages."""
+    global current_send_interval
+
+    text = update.message.text
+
+    # Handle stats button
+    if text == "📊 Статистика":
+        await cmd_stats(update, context)
+
+    # Handle send now button
+    elif text == "🖼️ Отправить сейчас":
+        await cmd_send_now(update, context)
+
+    # Handle reset history button
+    elif text == "🔄 Сбросить историю":
+        await cmd_reset_history(update, context)
+
+    # Handle help button
+    elif text == "ℹ️ Справка":
+        await cmd_help(update, context)
+
+    # Handle interval button
+    elif text == "⚙️ Интервал":
+        await cmd_set_interval(update, context)
+
+    # Handle interval selection
+    elif text in ["15 мин", "30 мин", "45 мин", "1 час"]:
+        interval_map = {
+            "15 мин": 15,
+            "30 мин": 30,
+            "45 мин": 45,
+            "1 час": 60,
+        }
+        current_send_interval = interval_map[text]
+        await update.message.reply_text(
+            f"✅ Интервал изменён на {current_send_interval} минут!\n"
+            f"Новое расписание будет использоваться со следующей отправки."
+        )
+        logger.info(f"Send interval changed to {current_send_interval} minutes")
+
+    # Handle back button
+    elif text == "Назад":
+        await cmd_start(update, context)
+
+
 async def scheduled_send(context: ContextTypes.DEFAULT_TYPE):
     """Callback for scheduled image sends."""
     try:
+        from datetime import datetime
+
+        # Check if current time is within working hours
+        current_hour = datetime.now().hour
+        if current_hour < Config.START_HOUR or current_hour >= Config.END_HOUR:
+            logger.info(f"Outside working hours ({Config.START_HOUR}:00 - {Config.END_HOUR}:00), skipping send")
+            return
+
         channel_id = context.job.data
         logger.info(f"Executing scheduled send to {channel_id}")
         await send_image(channel_id)
@@ -278,6 +355,11 @@ def setup_command_handlers(app: Application):
     app.add_handler(CommandHandler("send_now", cmd_send_now))
     app.add_handler(CommandHandler("reset_history", cmd_reset_history))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("set_interval", cmd_set_interval))
+
+    # Handle button presses
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
     logger.info("Command handlers registered")
 
 
@@ -289,6 +371,7 @@ async def setup_bot_commands(app: Application):
         BotCommand("start", "Главное меню"),
         BotCommand("stats", "Статистика отправок"),
         BotCommand("send_now", "Отправить одну картинку сейчас"),
+        BotCommand("set_interval", "Изменить интервал отправок"),
         BotCommand("reset_history", "Сбросить историю отправок"),
         BotCommand("help", "Справка по командам"),
     ]
@@ -304,19 +387,20 @@ def setup_schedule(application: Application, chat_id):
     """Setup scheduled image sends using job_queue."""
     job_queue = application.job_queue
 
-    current_hour = Config.START_HOUR
-    while current_hour < Config.END_HOUR:
-        # Schedule at specific time each day
-        job_queue.run_daily(
-            scheduled_send,
-            time=time(hour=current_hour, minute=0),
-            data=chat_id,
-            name=f"send_image_{current_hour:02d}:00"
-        )
-        logger.info(f"Scheduled send at {current_hour:02d}:00")
-        current_hour += Config.SEND_INTERVAL
+    # Convert interval from minutes to seconds
+    interval_seconds = current_send_interval * 60
 
-    logger.info(f"Job queue configured: {Config.START_HOUR}:00 to {Config.END_HOUR}:00 every {Config.SEND_INTERVAL} hours")
+    # Schedule image sends during working hours using run_repeating
+    # First send after 1 minute, then every interval_seconds
+    job_queue.run_repeating(
+        scheduled_send,
+        interval=interval_seconds,
+        first=60,  # First send after 60 seconds
+        data=chat_id,
+        name="repeating_image_send"
+    )
+
+    logger.info(f"Job queue configured: Send every {current_send_interval} minutes between {Config.START_HOUR}:00 and {Config.END_HOUR}:00")
 
 
 def main():
