@@ -1,9 +1,7 @@
 import os
 import logging
 import random
-import schedule
-import time
-import threading
+from datetime import time
 from pathlib import Path
 from config import Config
 from history import HistoryManager
@@ -263,7 +261,14 @@ async def cmd_send_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Ошибка при отправке картинки")
 
 
-# Note: Commands can be async, Application handles them properly
+async def scheduled_send(context: ContextTypes.DEFAULT_TYPE):
+    """Callback for scheduled image sends."""
+    try:
+        channel_id = context.job.data
+        logger.info(f"Executing scheduled send to {channel_id}")
+        await send_image(channel_id)
+    except Exception as e:
+        logger.error(f"Error in scheduled send: {e}")
 
 
 def setup_command_handlers(app: Application):
@@ -295,48 +300,23 @@ async def setup_bot_commands(app: Application):
         logger.error(f"Failed to register commands: {e}")
 
 
-def schedule_sends(chat_id):
-    """Schedule image sends during working hours."""
-    schedule.clear()
-
-    # Create sync wrapper for async send_image
-    send_task = create_schedule_task(chat_id)
+def setup_schedule(application: Application, chat_id):
+    """Setup scheduled image sends using job_queue."""
+    job_queue = application.job_queue
 
     current_hour = Config.START_HOUR
     while current_hour < Config.END_HOUR:
-        schedule_time = f"{current_hour:02d}:00"
-        schedule.every().day.at(schedule_time).do(send_task)
-        logger.info(f"Scheduled send at {schedule_time}")
+        # Schedule at specific time each day
+        job_queue.run_daily(
+            scheduled_send,
+            time=time(hour=current_hour, minute=0),
+            data=chat_id,
+            name=f"send_image_{current_hour:02d}:00"
+        )
+        logger.info(f"Scheduled send at {current_hour:02d}:00")
         current_hour += Config.SEND_INTERVAL
 
-    logger.info(f"Scheduling enabled: {Config.START_HOUR}:00 to {Config.END_HOUR}:00 every {Config.SEND_INTERVAL} hours")
-
-
-def create_schedule_task(chat_id):
-    """Create a sync wrapper for async send_image."""
-    def send_image_sync():
-        """Sync wrapper to run async send_image."""
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Event loop already running, create new one
-                new_loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(new_loop)
-                new_loop.run_until_complete(send_image(chat_id))
-                new_loop.close()
-            else:
-                loop.run_until_complete(send_image(chat_id))
-        except Exception as e:
-            logger.error(f"Error in scheduled send: {e}")
-    return send_image_sync
-
-
-def scheduler_loop():
-    """Main scheduler loop - runs in background."""
-    while True:
-        schedule.run_pending()
-        time.sleep(60)  # Check every minute
+    logger.info(f"Job queue configured: {Config.START_HOUR}:00 to {Config.END_HOUR}:00 every {Config.SEND_INTERVAL} hours")
 
 
 def main():
@@ -371,20 +351,14 @@ def main():
 
     setup_command_handlers(application)
 
+    # Setup job queue for scheduled sends
+    setup_schedule(application, chat_id)
+
     logger.info("Bot connected successfully")
-
-    # Schedule image sends
-    schedule_sends(chat_id)
-    logger.info("Image sending scheduler configured")
-
-    # Start background scheduler thread
-    scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
-    scheduler_thread.start()
-    logger.info("Scheduler thread started")
+    logger.info("Bot is running... Press Ctrl+C to stop.")
 
     # Run the bot
     try:
-        logger.info("Bot is running... Press Ctrl+C to stop.")
         application.run_polling()
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
