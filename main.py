@@ -32,6 +32,12 @@ available_images = []
 # Current send interval in minutes (can be changed at runtime)
 current_send_interval = 60  # Default 1 hour in minutes
 
+# Application instance for job rescheduling
+app_instance = None
+
+# Chat ID for job rescheduling
+chat_id_for_schedule = None
+
 
 def load_images():
     """Load all images from configured source."""
@@ -312,6 +318,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Handle interval selection
     elif text in ["15 мин", "30 мин", "45 мин", "1 час"]:
+        global current_send_interval, chat_id_for_schedule
         interval_map = {
             "15 мин": 15,
             "30 мин": 30,
@@ -321,9 +328,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_send_interval = interval_map[text]
         await update.message.reply_text(
             f"✅ Интервал изменён на {current_send_interval} минут!\n"
-            f"Новое расписание будет использоваться со следующей отправки."
+            f"Новое расписание вступит в силу со следующей отправки."
         )
         logger.info(f"Send interval changed to {current_send_interval} minutes")
+        # Reschedule the job with the new interval
+        if chat_id_for_schedule:
+            reschedule_job(chat_id_for_schedule)
 
     # Handle back button
     elif text == "Назад":
@@ -403,8 +413,39 @@ def setup_schedule(application: Application, chat_id):
     logger.info(f"Job queue configured: Send every {current_send_interval} minutes between {Config.START_HOUR}:00 and {Config.END_HOUR}:00")
 
 
+def reschedule_job(chat_id):
+    """Reschedule the image send job with the current interval."""
+    global app_instance
+
+    if not app_instance:
+        logger.error("Application instance not available for rescheduling")
+        return
+
+    job_queue = app_instance.job_queue
+
+    # Remove old job
+    job_queue.get_jobs_by_name("repeating_image_send")[0].schedule_removal()
+    logger.info("Old job removed")
+
+    # Convert interval from minutes to seconds
+    interval_seconds = current_send_interval * 60
+
+    # Create new job with updated interval
+    job_queue.run_repeating(
+        scheduled_send,
+        interval=interval_seconds,
+        first=60,
+        data=chat_id,
+        name="repeating_image_send"
+    )
+
+    logger.info(f"Job rescheduled: Send every {current_send_interval} minutes")
+
+
 def main():
     """Main function."""
+    global app_instance, chat_id_for_schedule
+
     logger.info("Starting Picture Bot...")
 
     # Validate configuration
@@ -427,8 +468,14 @@ def main():
         # It's a channel name like @drunklinked
         chat_id = Config.CHAT_ID
 
+    # Store chat_id for job rescheduling
+    chat_id_for_schedule = chat_id
+
     # Initialize and setup Application
     application = Application.builder().token(Config.BOT_TOKEN).build()
+
+    # Store application instance for job rescheduling
+    app_instance = application
 
     # Set post_init callback to register commands
     application.post_init = lambda app: setup_bot_commands(app)
